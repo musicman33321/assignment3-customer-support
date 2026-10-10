@@ -1,0 +1,112 @@
+# mcp_toolbox/tools.yaml: every database access the agent can make (M-2, M-3).
+# Stage 2 decision: ownership is enforced in the SQL, not the prompt (M-4). The
+# customer_email parameter is bound from the login session in stage 3 (M-5).
+# The password comes from the environment, never from this file.
+
+sources:
+  support-db:
+    kind: postgres
+    host: 127.0.0.1
+    port: 5432
+    database: support
+    user: support_toolbox
+    password: ${TOOLBOX_DB_PASSWORD}
+
+tools:
+  get-order-status:
+    kind: postgres-sql
+    source: support-db
+    description: >
+      Look up one order that belongs to the logged-in customer. Returns the order's status,
+      items, delivery address, date and total. Returns no rows if the order does not exist
+      or does not belong to this customer.
+    parameters:
+      - name: order_id
+        type: integer
+        description: The numeric order id the customer is asking about.
+      - name: customer_email
+        type: string
+        description: The logged-in customer's email. Bound from the session.
+    statement: |
+      SELECT order_id, customer_email, status, items, delivery_address, order_date, total_amount
+      FROM customer_orders
+      WHERE order_id = $1 AND customer_email = $2;
+
+  find-customer-orders:
+    kind: postgres-sql
+    source: support-db
+    description: >
+      List every order that belongs to the logged-in customer, newest first. Use this for
+      "my orders", "my last order", "my history", or when the customer names a product but
+      not an order id.
+    parameters:
+      - name: customer_email
+        type: string
+        description: The logged-in customer's email. Bound from the session.
+    statement: |
+      SELECT order_id, status, items, delivery_address, order_date, total_amount
+      FROM customer_orders
+      WHERE customer_email = $1
+      ORDER BY order_date DESC;
+
+  action-log:
+    kind: postgres-sql
+    source: support-db
+    description: >
+      Record a change the customer has requested so a person can carry it out. This never
+      changes an order itself. If the request concerns an order, parameters must include
+      "order_id"; the record is refused (zero rows returned) when that order does not belong
+      to the logged-in customer.
+    parameters:
+      - name: user_email
+        type: string
+        description: The logged-in customer's email. Bound from the session.
+      - name: action_type
+        type: string
+        description: >
+          Exactly one of: CANCEL_ORDER, RETURN_ORDER, UPDATE_ADDRESS, UPDATE_PREFERENCE,
+          UPDATE_PROFILE. Any other value is rejected by the database.
+      - name: parameters
+        type: string
+        description: >
+          A JSON object with the details, as a string. Include "order_id" (a number) whenever
+          an order is involved, e.g. {"order_id": 4, "reason": "ordered by mistake"}.
+    # M-8: INSERT ... SELECT ... WHERE. The row is inserted only when there is no order_id,
+    # or when the named order belongs to this user. Otherwise zero rows come back.
+    statement: |
+      INSERT INTO actions_log (user_email, action_type, parameters)
+      SELECT $1, $2, $3::jsonb
+      WHERE ($3::jsonb ->> 'order_id') IS NULL
+         OR EXISTS (
+              SELECT 1 FROM customer_orders
+              WHERE order_id = ($3::jsonb ->> 'order_id')::int
+                AND customer_email = $1
+            )
+      RETURNING id, timestamp, action_type, parameters;
+
+  # Login check for the CLI and web app. NOT in the agent's toolset (M-2: no SQL in Python,
+  # so even login goes through a tool). Demo-only plain-text password per SPEC §8.
+  verify-login:
+    kind: postgres-sql
+    source: support-db
+    description: Return the user row when email and password match; no rows otherwise.
+    parameters:
+      - name: email
+        type: string
+        description: The email typed at login.
+      - name: password
+        type: string
+        description: The password typed at login.
+    statement: |
+      SELECT email, full_name, is_premium_customer
+      FROM users
+      WHERE email = $1 AND password = $2;
+
+# M-6: this is the only toolset the agent loads. Nothing in it can change customer_orders.
+toolsets:
+  support-agent:
+    - get-order-status
+    - find-customer-orders
+    - action-log
+  auth:
+    - verify-login
